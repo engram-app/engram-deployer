@@ -1,0 +1,216 @@
+package tfapply
+
+import (
+	"bufio"
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"syscall"
+	"time"
+
+	"github.com/engram-app/engram-deployer/internal/server"
+)
+
+// Orchestrator implements server.TFApplier by shelling out to git +
+// terraform on the host.
+//
+// All fields are required. Construct once at startup, reuse across
+// requests — the server serializes via applyMu so concurrent Run calls
+// don't happen.
+type Orchestrator struct {
+	// TFBinary is the absolute or PATH-relative path to the terraform
+	// binary. Defaults to "terraform" if empty.
+	TFBinary string
+
+	// GitBinary is the absolute or PATH-relative path to git. Defaults
+	// to "git" if empty.
+	GitBinary string
+
+	// RepoURL is the HTTPS URL to clone. Pinned to one repo at startup
+	// so a malicious /tf-apply caller can't redirect us elsewhere.
+	RepoURL string
+
+	// RootDir is the path within the repo containing the terraform
+	// root to apply (e.g. "main/envs/staging-fastraid").
+	RootDir string
+
+	// WorkDir is the absolute path the daemon owns for cloning the
+	// repo. Wiped + recreated every run for hermeticity.
+	WorkDir string
+
+	// Env is the additional environment for git + terraform
+	// subprocesses (AWS creds, region, DOCKER_HOST). Merged on top of
+	// the daemon's os.Environ() so PATH etc. are preserved.
+	Env []string
+}
+
+// Compile-time check that Orchestrator satisfies server.TFApplier.
+var _ server.TFApplier = (*Orchestrator)(nil)
+
+// Run performs the full apply cycle for sha. It MUST close events
+// before returning so the HTTP handler's range loop terminates.
+func (o *Orchestrator) Run(ctx context.Context, sha string, events chan<- server.TFApplyEvent) error {
+	defer close(events)
+
+	if err := o.validate(); err != nil {
+		return fmt.Errorf("orchestrator config invalid: %w", err)
+	}
+
+	emit := func(phase, msg string) {
+		select {
+		case events <- server.TFApplyEvent{Phase: phase, Message: msg, Time: time.Now()}:
+		case <-ctx.Done():
+		}
+	}
+
+	// 1. Fresh workdir.
+	emit("git_fetch", fmt.Sprintf("preparing %s", o.WorkDir))
+	if err := os.RemoveAll(o.WorkDir); err != nil {
+		return fmt.Errorf("clear workdir: %w", err)
+	}
+	if err := os.MkdirAll(o.WorkDir, 0o700); err != nil {
+		return fmt.Errorf("create workdir: %w", err)
+	}
+
+	// 2. Shallow clone + checkout SHA.
+	if err := o.cloneAtSHA(ctx, sha, events); err != nil {
+		return fmt.Errorf("git clone @%s: %w", sha, err)
+	}
+
+	rootPath := filepath.Join(o.WorkDir, o.RootDir)
+	if _, err := os.Stat(rootPath); err != nil {
+		return fmt.Errorf("terraform root %s missing in repo @%s: %w", o.RootDir, sha, err)
+	}
+
+	// 3. terraform init.
+	if err := o.tfInit(ctx, rootPath, events); err != nil {
+		return fmt.Errorf("terraform init: %w", err)
+	}
+
+	// 4. terraform apply.
+	if err := o.tfApply(ctx, rootPath, events); err != nil {
+		return fmt.Errorf("terraform apply: %w", err)
+	}
+
+	emit("done", "apply complete")
+	return nil
+}
+
+func (o *Orchestrator) validate() error {
+	if o.RepoURL == "" {
+		return fmt.Errorf("RepoURL is required")
+	}
+	if o.RootDir == "" {
+		return fmt.Errorf("RootDir is required")
+	}
+	if o.WorkDir == "" {
+		return fmt.Errorf("WorkDir is required")
+	}
+	return nil
+}
+
+func (o *Orchestrator) gitBin() string {
+	if o.GitBinary != "" {
+		return o.GitBinary
+	}
+	return "git"
+}
+
+func (o *Orchestrator) tfBin() string {
+	if o.TFBinary != "" {
+		return o.TFBinary
+	}
+	return "terraform"
+}
+
+// cloneAtSHA shallow-clones the repo and checks out exactly sha. Two
+// git invocations rather than one `git clone --depth 1 <branch>` so we
+// pin to SHA, not a branch tip that could shift between PR merge and
+// our checkout.
+func (o *Orchestrator) cloneAtSHA(ctx context.Context, sha string, events chan<- server.TFApplyEvent) error {
+	clone := exec.CommandContext(ctx, o.gitBin(),
+		"clone", "--filter=blob:none", "--no-checkout", o.RepoURL, o.WorkDir,
+	)
+	clone.Env = o.fullEnv()
+	if err := streamCommand(ctx, clone, "git_fetch", events); err != nil {
+		return err
+	}
+
+	checkout := exec.CommandContext(ctx, o.gitBin(),
+		"-C", o.WorkDir, "checkout", "--detach", sha,
+	)
+	checkout.Env = o.fullEnv()
+	return streamCommand(ctx, checkout, "git_fetch", events)
+}
+
+func (o *Orchestrator) tfInit(ctx context.Context, rootPath string, events chan<- server.TFApplyEvent) error {
+	cmd := exec.CommandContext(ctx, o.tfBin(),
+		"-chdir="+rootPath, "init", "-input=false", "-no-color",
+	)
+	cmd.Env = o.fullEnv()
+	return streamCommand(ctx, cmd, "tf_init", events)
+}
+
+func (o *Orchestrator) tfApply(ctx context.Context, rootPath string, events chan<- server.TFApplyEvent) error {
+	cmd := exec.CommandContext(ctx, o.tfBin(),
+		"-chdir="+rootPath, "apply", "-input=false", "-auto-approve", "-no-color",
+	)
+	cmd.Env = o.fullEnv()
+	return streamCommand(ctx, cmd, "tf_apply", events)
+}
+
+func (o *Orchestrator) fullEnv() []string {
+	base := os.Environ()
+	return append(base, o.Env...)
+}
+
+// streamCommand runs cmd with combined stdout+stderr forwarded line by
+// line to events under the given phase. Returns the command's exit
+// error (with output context for diagnosis).
+func streamCommand(ctx context.Context, cmd *exec.Cmd, phase string, events chan<- server.TFApplyEvent) error {
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("stdout pipe: %w", err)
+	}
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("stderr pipe: %w", err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start %s: %w", cmd.Path, err)
+	}
+
+	done := make(chan struct{}, 2)
+	go pipeLines(ctx, stdoutPipe, phase, events, done)
+	go pipeLines(ctx, stderrPipe, phase, events, done)
+	<-done
+	<-done
+
+	return cmd.Wait()
+}
+
+func pipeLines(ctx context.Context, r io.Reader, phase string, events chan<- server.TFApplyEvent, done chan<- struct{}) {
+	defer func() { done <- struct{}{} }()
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		select {
+		case events <- server.TFApplyEvent{Phase: phase, Message: line, Time: time.Now()}:
+		case <-ctx.Done():
+			return
+		}
+	}
+}

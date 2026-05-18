@@ -36,26 +36,47 @@ installed via Unraid plugin) and executes the deploy locally. Runner holds
 
 ## Security model
 
-Three independent gates on every `/deploy`:
+Three independent gates on every `/deploy` and every `/tf-apply`:
 
-1. **OIDC** — JWT signature verified against GitHub's JWKS. Claims allowlisted:
-   `aud=engram-deploy`, `repository=engram-app/Engram`, `ref=refs/heads/main`,
-   `workflow_ref` pinned to the deploy workflow file.
-2. **JTI replay** — each token's `jti` is recorded; second sighting refused.
+1. **OIDC** — JWT signature verified against GitHub's JWKS. Each endpoint
+   pins its OWN audience + repository + workflow_ref allowlist:
+   - `/deploy` accepts only `aud=engram-deploy`, `repository=engram-app/Engram`,
+     `workflow_ref=engram-app/Engram/.github/workflows/ci.yml@refs/heads/main`.
+   - `/tf-apply` accepts only `aud=engram-tf-apply`,
+     `repository=engram-app/engram-infra`,
+     `workflow_ref=engram-app/engram-infra/.github/workflows/tf-apply.yml@refs/heads/main`.
+   - A token minted for one endpoint cannot drive the other.
+2. **JTI replay** — each token's `jti` is recorded across BOTH endpoints;
+   second sighting refused regardless of which endpoint saw it first.
 3. **Source IP allowlist** — only the runner VM's IP at the daemon layer
    (firewall also enforces this at the host).
 
 Plus: TLS on the wire (self-signed cert, pinned in CI), firewall rule on
-SlowRaid permitting only VM → FastRaid:8443.
+SlowRaid permitting only VM → FastRaid:8443. `/deploy` and `/tf-apply`
+serialize on an internal mutex so they cannot mutate Docker state
+concurrently.
+
+## Endpoints
+
+| Method | Path                | Auth | Purpose |
+|--------|---------------------|------|---------|
+| POST   | `/deploy`           | OIDC | Pull + restart engram-saas/selfhost at a given version |
+| POST   | `/tf-apply`         | OIDC | Run `terraform apply` against local Docker socket (engram-infra @sha) |
+| GET    | `/status`           | none | Last `/deploy` result |
+| GET    | `/tf-apply/status`  | none | Last `/tf-apply` result |
+| GET    | `/healthz`          | none | Liveness probe |
+
+`/tf-apply` is opt-in — wired only when `DEPLOYER_TF_APPLY_*` env is configured.
 
 ## Repo layout
 
 ```
 cmd/deployer/         Entrypoint
 internal/auth/        OIDC + JTI + IP allowlist
-internal/server/      TLS HTTP server, /deploy /status /healthz
+internal/server/      TLS HTTP server, /deploy /tf-apply /status /healthz
 internal/deploy/      Pure-Go deploy logic (docker pull/tag, template edit,
                       update_container exec, health poll)
+internal/tfapply/     terraform-apply orchestrator (git clone + tf init + apply)
 package/              Unraid plugin (.plg) + rc.d start script
 ```
 
@@ -66,6 +87,6 @@ go build -o engram-deployer ./cmd/deployer
 ./engram-deployer
 ```
 
-## Status
-
-Scaffold. No logic yet. See task list in main session.
+External binaries on the host (required when `/tf-apply` is enabled):
+`terraform`, `git`. Pinned via `DEPLOYER_TF_BINARY_PATH` /
+`DEPLOYER_TF_GIT_BINARY_PATH` env if not on PATH.
