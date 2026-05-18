@@ -23,6 +23,11 @@
 <![CDATA[
 
 ### &version;
+- /tf-apply clone now mints a GitHub App installation token for
+  private engram-infra HTTPS clones (no static PAT required)
+- new env: DEPLOYER_TF_APPLY_GH_APP_ID / _INSTALLATION_ID / _PEM_PATH
+
+### 0.1.5
 - /tf-apply endpoint: OIDC-gated terraform apply against local Docker socket
 - /deploy and /tf-apply serialize on a shared mutex (Docker state safety)
 - repo + author rebrand to engram-app org

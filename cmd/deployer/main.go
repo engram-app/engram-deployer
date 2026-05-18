@@ -56,6 +56,15 @@ type config struct {
 	TFAWSSecretKey     string
 	TFAWSRegion        string
 	TFDockerHost       string
+
+	// GitHub App credentials for minting installation tokens used to
+	// clone private engram-infra. All three required when tf-apply is
+	// enabled AND the repo URL is https://github.com/... (any other
+	// URL bypasses App-token minting; daemon clones with whatever
+	// credentials git can resolve).
+	TFAppID             string
+	TFAppInstallationID string
+	TFAppPEMPath        string
 }
 
 func loadConfig() (config, error) {
@@ -91,6 +100,10 @@ func loadConfig() (config, error) {
 		TFAWSSecretKey:     os.Getenv("DEPLOYER_TF_AWS_SECRET_ACCESS_KEY"),
 		TFAWSRegion:        envOr("DEPLOYER_TF_AWS_REGION", "us-east-1"),
 		TFDockerHost:       envOr("DEPLOYER_TF_DOCKER_HOST", "unix:///var/run/docker.sock"),
+
+		TFAppID:             os.Getenv("DEPLOYER_TF_APPLY_GH_APP_ID"),
+		TFAppInstallationID: os.Getenv("DEPLOYER_TF_APPLY_GH_APP_INSTALLATION_ID"),
+		TFAppPEMPath:        os.Getenv("DEPLOYER_TF_APPLY_GH_APP_PEM_PATH"),
 	}
 	var missing []string
 	if cfg.CertFile == "" {
@@ -128,6 +141,20 @@ func loadConfig() (config, error) {
 		}
 		if cfg.TFAWSSecretKey == "" {
 			tfMissing = append(tfMissing, "DEPLOYER_TF_AWS_SECRET_ACCESS_KEY")
+		}
+		// App credentials required when cloning private https://github.com/...
+		// repos. If the operator points at a public repo or SSH URL, all
+		// three may be empty (the daemon will not try to mint a token).
+		if strings.HasPrefix(cfg.TFApplyRepoURL, "https://github.com/") {
+			if cfg.TFAppID == "" {
+				tfMissing = append(tfMissing, "DEPLOYER_TF_APPLY_GH_APP_ID")
+			}
+			if cfg.TFAppInstallationID == "" {
+				tfMissing = append(tfMissing, "DEPLOYER_TF_APPLY_GH_APP_INSTALLATION_ID")
+			}
+			if cfg.TFAppPEMPath == "" {
+				tfMissing = append(tfMissing, "DEPLOYER_TF_APPLY_GH_APP_PEM_PATH")
+			}
 		}
 		if len(tfMissing) > 0 {
 			missing = append(missing, tfMissing...)
@@ -255,6 +282,17 @@ func main() {
 				"AWS_DEFAULT_REGION=" + cfg.TFAWSRegion,
 				"DOCKER_HOST=" + cfg.TFDockerHost,
 			},
+		}
+		if cfg.TFAppID != "" && cfg.TFAppInstallationID != "" && cfg.TFAppPEMPath != "" {
+			appSrc := &tfapply.AppTokenSource{
+				AppID:          cfg.TFAppID,
+				InstallationID: cfg.TFAppInstallationID,
+				PEMPath:        cfg.TFAppPEMPath,
+			}
+			if err := appSrc.Verify(); err != nil {
+				log.Fatalf("verify tf-apply App token source: %v", err)
+			}
+			tfOrch.TokenSource = appSrc
 		}
 
 		srvCfg.TFApplyValidator = tfValidator

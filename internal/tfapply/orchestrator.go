@@ -5,9 +5,11 @@ import (
 	"context"
 	"fmt"
 	"io"
+	neturl "net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -45,6 +47,22 @@ type Orchestrator struct {
 	// subprocesses (AWS creds, region, DOCKER_HOST). Merged on top of
 	// the daemon's os.Environ() so PATH etc. are preserved.
 	Env []string
+
+	// TokenSource, when non-nil and RepoURL is https://github.com/...,
+	// mints a fresh installation token before cloning and injects it
+	// into the URL as `https://x-access-token:<token>@github.com/...`.
+	// Nil means clone with whatever credentials git resolves on its
+	// own (anonymous for public repos, key-based for SSH URLs).
+	//
+	// Interface (not concrete type) so tests can substitute fakes.
+	TokenSource TokenSource
+}
+
+// TokenSource is the minimal contract Orchestrator needs to obtain a
+// short-lived clone credential. Production uses AppTokenSource;
+// tests use an in-process fake.
+type TokenSource interface {
+	Mint(ctx context.Context) (string, error)
 }
 
 // Compile-time check that Orchestrator satisfies server.TFApplier.
@@ -130,9 +148,19 @@ func (o *Orchestrator) tfBin() string {
 // git invocations rather than one `git clone --depth 1 <branch>` so we
 // pin to SHA, not a branch tip that could shift between PR merge and
 // our checkout.
+//
+// If TokenSource is set and RepoURL is an https://github.com/... URL,
+// mints a short-lived App installation token and injects it as basic
+// auth in the URL. The token never reaches the events stream — only
+// the redacted form of the URL appears in event messages.
 func (o *Orchestrator) cloneAtSHA(ctx context.Context, sha string, events chan<- server.TFApplyEvent) error {
+	cloneURL, err := o.resolveCloneURL(ctx)
+	if err != nil {
+		return fmt.Errorf("resolve clone URL: %w", err)
+	}
+
 	clone := exec.CommandContext(ctx, o.gitBin(),
-		"clone", "--filter=blob:none", "--no-checkout", o.RepoURL, o.WorkDir,
+		"clone", "--filter=blob:none", "--no-checkout", cloneURL, o.WorkDir,
 	)
 	clone.Env = o.fullEnv()
 	if err := streamCommand(ctx, clone, "git_fetch", events); err != nil {
@@ -144,6 +172,32 @@ func (o *Orchestrator) cloneAtSHA(ctx context.Context, sha string, events chan<-
 	)
 	checkout.Env = o.fullEnv()
 	return streamCommand(ctx, checkout, "git_fetch", events)
+}
+
+// resolveCloneURL returns the URL to pass to `git clone`. If TokenSource
+// is set and RepoURL is https://github.com/..., mints a fresh
+// installation token and embeds it as `x-access-token` basic auth.
+// Otherwise returns RepoURL unchanged.
+func (o *Orchestrator) resolveCloneURL(ctx context.Context) (string, error) {
+	if o.TokenSource == nil {
+		return o.RepoURL, nil
+	}
+	if !strings.HasPrefix(o.RepoURL, "https://github.com/") {
+		// TokenSource only helps for HTTPS GitHub URLs.
+		return o.RepoURL, nil
+	}
+
+	tok, err := o.TokenSource.Mint(ctx)
+	if err != nil {
+		return "", fmt.Errorf("mint App token: %w", err)
+	}
+
+	parsed, err := neturl.Parse(o.RepoURL)
+	if err != nil {
+		return "", fmt.Errorf("parse RepoURL: %w", err)
+	}
+	parsed.User = neturl.UserPassword("x-access-token", tok)
+	return parsed.String(), nil
 }
 
 func (o *Orchestrator) tfInit(ctx context.Context, rootPath string, events chan<- server.TFApplyEvent) error {
