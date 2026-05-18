@@ -1,7 +1,7 @@
 <?xml version='1.0' standalone='yes'?>
 <!DOCTYPE PLUGIN [
   <!ENTITY name      "engram-deployer">
-  <!ENTITY author    "Rasbandit">
+  <!ENTITY author    "engram-app">
   <!ENTITY version   "0.0.0-DEV">
   <!ENTITY arch      "x86_64">
   <!ENTITY build     "1">
@@ -23,7 +23,12 @@
 <![CDATA[
 
 ### &version;
-- pull-based deploy daemon for Engram on FastRaid
+- /tf-apply endpoint: OIDC-gated terraform apply against local Docker socket
+- /deploy and /tf-apply serialize on a shared mutex (Docker state safety)
+- repo + author rebrand to engram-app org
+
+### 0.1.4 and earlier
+- push-based deploy daemon for Engram on FastRaid
 - OIDC + JTI + IP allowlist gates on /deploy
 - replaces CI-pushes-via-SSH-as-root pattern
 

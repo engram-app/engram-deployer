@@ -56,6 +56,12 @@ func (s *Server) deploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Serialize against /tf-apply. Both endpoints mutate Docker state
+	// on the same host; concurrent runs could leave engram-saas in an
+	// inconsistent state.
+	s.applyMu.Lock()
+	defer s.applyMu.Unlock()
+
 	// Switch to streaming. Once we write anything, status is committed to 200;
 	// success/failure conveyed via terminal {status: "ok"|"fail"} line.
 	flusher, ok := w.(http.Flusher)

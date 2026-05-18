@@ -11,11 +11,18 @@ import (
 )
 
 // Config bundles the dependencies a Server needs.
+//
+// /deploy is always wired. /tf-apply is wired only when both
+// TFApplyValidator and TFApplier are non-nil — leaving either nil
+// disables the endpoint entirely (404).
 type Config struct {
 	Validator *auth.Validator
 	JTI       *auth.JTISet
 	IPAllow   *auth.IPAllowlist
 	Deployer  Deployer
+
+	TFApplyValidator *auth.Validator
+	TFApplier        TFApplier
 }
 
 // Server is the HTTP entrypoint for the deployer daemon.
@@ -25,8 +32,13 @@ type Server struct {
 	cfg Config
 	mux *http.ServeMux
 
-	mu         sync.RWMutex
-	lastResult *DeployResult
+	mu                sync.RWMutex
+	lastResult        *DeployResult
+	lastTFApplyResult *TFApplyResult
+
+	// applyMu serializes /deploy and /tf-apply — both mutate Docker
+	// state on the same host and must not run concurrently.
+	applyMu sync.Mutex
 }
 
 // New wires the routes against cfg.
@@ -35,6 +47,10 @@ func New(cfg Config) *Server {
 	s.mux.HandleFunc("GET /healthz", s.healthz)
 	s.mux.HandleFunc("POST /deploy", s.deploy)
 	s.mux.HandleFunc("GET /status", s.status)
+	if cfg.TFApplyValidator != nil && cfg.TFApplier != nil {
+		s.mux.HandleFunc("POST /tf-apply", s.tfApply)
+		s.mux.HandleFunc("GET /tf-apply/status", s.tfApplyStatus)
+	}
 	return s
 }
 

@@ -40,18 +40,58 @@ func (f *fakeDeployer) CalledWith() string {
 	return f.calledWith
 }
 
+// fakeTFApplier mirrors fakeDeployer for /tf-apply.
+type fakeTFApplier struct {
+	mu         sync.Mutex
+	calledWith string
+	scriptEvts []TFApplyEvent
+	scriptErr  error
+}
+
+func (f *fakeTFApplier) Run(_ context.Context, sha string, events chan<- TFApplyEvent) error {
+	f.mu.Lock()
+	f.calledWith = sha
+	evs := append([]TFApplyEvent(nil), f.scriptEvts...)
+	err := f.scriptErr
+	f.mu.Unlock()
+
+	for _, e := range evs {
+		events <- e
+	}
+	close(events)
+	return err
+}
+
+func (f *fakeTFApplier) CalledWith() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calledWith
+}
+
 // testServerOpts is configured via the functional opts passed to newTestServer.
 type testServerOpts struct {
 	deployer Deployer
+
+	// wireTFApply toggles whether /tf-apply is wired. Default off so
+	// existing /deploy tests don't pull in tf-apply machinery.
+	wireTFApply bool
+	tfApplier   TFApplier
 }
 
 func withDeployer(d Deployer) func(*testServerOpts) {
 	return func(o *testServerOpts) { o.deployer = d }
 }
 
+func withTFApplier(a TFApplier) func(*testServerOpts) {
+	return func(o *testServerOpts) {
+		o.wireTFApply = true
+		o.tfApplier = a
+	}
+}
+
 // newTestServer constructs a Server wired to the in-process OIDC test issuer
 // (oidctest.Shared) and a fake Deployer. Caller can override the deployer
-// with withDeployer.
+// with withDeployer, or wire /tf-apply with withTFApplier.
 func newTestServer(t *testing.T, opts ...func(*testServerOpts)) *Server {
 	t.Helper()
 
@@ -78,12 +118,33 @@ func newTestServer(t *testing.T, opts ...func(*testServerOpts)) *Server {
 		t.Fatalf("ip allowlist init: %v", err)
 	}
 
-	return New(Config{
+	cfg := Config{
 		Validator: validator,
 		JTI:       auth.NewJTISet(100, 30*time.Minute),
 		IPAllow:   ipAllow,
 		Deployer:  o.deployer,
-	})
+	}
+
+	if o.wireTFApply {
+		tfValidator, err := auth.NewValidator(context.Background(), auth.OIDCConfig{
+			JWKSURL:     iss.JWKSURL(),
+			Issuer:      "https://token.actions.githubusercontent.com",
+			Audience:    "engram-tf-apply",
+			Repository:  "engram-app/engram-infra",
+			Ref:         "refs/heads/main",
+			WorkflowRef: "engram-app/engram-infra/.github/workflows/tf-apply.yml@refs/heads/main",
+		})
+		if err != nil {
+			t.Fatalf("tf-apply validator init: %v", err)
+		}
+		cfg.TFApplyValidator = tfValidator
+		if o.tfApplier == nil {
+			o.tfApplier = &fakeTFApplier{}
+		}
+		cfg.TFApplier = o.tfApplier
+	}
+
+	return New(cfg)
 }
 
 // mintValidToken returns a freshly-signed OIDC token whose claims pass
@@ -103,5 +164,25 @@ func mintValidToken(t *testing.T, jti string) string {
 		"repository":   "engram-app/Engram",
 		"ref":          "refs/heads/main",
 		"workflow_ref": "engram-app/Engram/.github/workflows/ci.yml@refs/heads/main",
+	})
+}
+
+// mintValidTFApplyToken returns a freshly-signed OIDC token whose claims
+// pass the /tf-apply validator gate (different audience + repo +
+// workflow_ref pin than /deploy).
+func mintValidTFApplyToken(t *testing.T, jti string) string {
+	t.Helper()
+	iss := oidctest.Shared(t)
+	now := time.Now()
+	return iss.Mint(t, jwt.MapClaims{
+		"iss":          "https://token.actions.githubusercontent.com",
+		"aud":          "engram-tf-apply",
+		"iat":          now.Unix(),
+		"nbf":          now.Unix(),
+		"exp":          now.Add(15 * time.Minute).Unix(),
+		"jti":          jti,
+		"repository":   "engram-app/engram-infra",
+		"ref":          "refs/heads/main",
+		"workflow_ref": "engram-app/engram-infra/.github/workflows/tf-apply.yml@refs/heads/main",
 	})
 }
