@@ -16,12 +16,13 @@ import (
 	"github.com/engram-app/engram-deployer/internal/server"
 )
 
-// Orchestrator implements server.TFApplier by shelling out to git +
-// terraform on the host.
+// Orchestrator implements both server.TFApplier and server.TFPlanner by
+// shelling out to git + terraform on the host. /tf-apply and /tf-plan
+// share clone + init logic; only the final terraform invocation differs.
 //
 // All fields are required. Construct once at startup, reuse across
-// requests — the server serializes via applyMu so concurrent Run calls
-// don't happen.
+// requests — the server serializes apply + plan via applyMu so
+// concurrent Run/Plan calls don't happen on the same workdir.
 type Orchestrator struct {
 	// TFBinary is the absolute or PATH-relative path to the terraform
 	// binary. Defaults to "terraform" if empty.
@@ -65,17 +66,22 @@ type TokenSource interface {
 	Mint(ctx context.Context) (string, error)
 }
 
-// Compile-time check that Orchestrator satisfies server.TFApplier.
-var _ server.TFApplier = (*Orchestrator)(nil)
+// emitFn forwards a phase + line to whichever event channel the caller
+// owns. Returns the typed events back through the closure so cloneAtSHA
+// + tfInit + streamCommand don't care whether they're servicing an
+// apply or a plan request.
+type emitFn func(phase, msg string)
+
+// Compile-time check that Orchestrator satisfies both server interfaces.
+var (
+	_ server.TFApplier = (*Orchestrator)(nil)
+	_ server.TFPlanner = (*Orchestrator)(nil)
+)
 
 // Run performs the full apply cycle for sha. It MUST close events
 // before returning so the HTTP handler's range loop terminates.
 func (o *Orchestrator) Run(ctx context.Context, sha string, events chan<- server.TFApplyEvent) error {
 	defer close(events)
-
-	if err := o.validate(); err != nil {
-		return fmt.Errorf("orchestrator config invalid: %w", err)
-	}
 
 	emit := func(phase, msg string) {
 		select {
@@ -84,37 +90,75 @@ func (o *Orchestrator) Run(ctx context.Context, sha string, events chan<- server
 		}
 	}
 
-	// 1. Fresh workdir.
-	emit("git_fetch", fmt.Sprintf("preparing %s", o.WorkDir))
-	if err := os.RemoveAll(o.WorkDir); err != nil {
-		return fmt.Errorf("clear workdir: %w", err)
-	}
-	if err := os.MkdirAll(o.WorkDir, 0o700); err != nil {
-		return fmt.Errorf("create workdir: %w", err)
+	rootPath, err := o.prepare(ctx, sha, emit)
+	if err != nil {
+		return err
 	}
 
-	// 2. Shallow clone + checkout SHA.
-	if err := o.cloneAtSHA(ctx, sha, events); err != nil {
-		return fmt.Errorf("git clone @%s: %w", sha, err)
-	}
-
-	rootPath := filepath.Join(o.WorkDir, o.RootDir)
-	if _, err := os.Stat(rootPath); err != nil {
-		return fmt.Errorf("terraform root %s missing in repo @%s: %w", o.RootDir, sha, err)
-	}
-
-	// 3. terraform init.
-	if err := o.tfInit(ctx, rootPath, events); err != nil {
-		return fmt.Errorf("terraform init: %w", err)
-	}
-
-	// 4. terraform apply.
-	if err := o.tfApply(ctx, rootPath, events); err != nil {
+	if err := o.tfApply(ctx, rootPath, emit); err != nil {
 		return fmt.Errorf("terraform apply: %w", err)
 	}
 
 	emit("done", "apply complete")
 	return nil
+}
+
+// Plan performs init + plan for sha without mutating infra. Mirrors Run
+// but stops after `terraform plan`. Plan output is streamed line-by-line
+// through events under phase=tf_plan so the caller (typically a CI
+// workflow) can collect it for a PR comment.
+func (o *Orchestrator) Plan(ctx context.Context, sha string, events chan<- server.TFPlanEvent) error {
+	defer close(events)
+
+	emit := func(phase, msg string) {
+		select {
+		case events <- server.TFPlanEvent{Phase: phase, Message: msg, Time: time.Now()}:
+		case <-ctx.Done():
+		}
+	}
+
+	rootPath, err := o.prepare(ctx, sha, emit)
+	if err != nil {
+		return err
+	}
+
+	if err := o.tfPlan(ctx, rootPath, emit); err != nil {
+		return fmt.Errorf("terraform plan: %w", err)
+	}
+
+	emit("done", "plan complete")
+	return nil
+}
+
+// prepare clears the workdir, clones the repo at sha, runs terraform
+// init, and returns the absolute path to the terraform root. Shared by
+// Run + Plan; both need this exact prologue.
+func (o *Orchestrator) prepare(ctx context.Context, sha string, emit emitFn) (string, error) {
+	if err := o.validate(); err != nil {
+		return "", fmt.Errorf("orchestrator config invalid: %w", err)
+	}
+
+	emit("git_fetch", fmt.Sprintf("preparing %s", o.WorkDir))
+	if err := os.RemoveAll(o.WorkDir); err != nil {
+		return "", fmt.Errorf("clear workdir: %w", err)
+	}
+	if err := os.MkdirAll(o.WorkDir, 0o700); err != nil {
+		return "", fmt.Errorf("create workdir: %w", err)
+	}
+
+	if err := o.cloneAtSHA(ctx, sha, emit); err != nil {
+		return "", fmt.Errorf("git clone @%s: %w", sha, err)
+	}
+
+	rootPath := filepath.Join(o.WorkDir, o.RootDir)
+	if _, err := os.Stat(rootPath); err != nil {
+		return "", fmt.Errorf("terraform root %s missing in repo @%s: %w", o.RootDir, sha, err)
+	}
+
+	if err := o.tfInit(ctx, rootPath, emit); err != nil {
+		return "", fmt.Errorf("terraform init: %w", err)
+	}
+	return rootPath, nil
 }
 
 func (o *Orchestrator) validate() error {
@@ -153,7 +197,7 @@ func (o *Orchestrator) tfBin() string {
 // mints a short-lived App installation token and injects it as basic
 // auth in the URL. The token never reaches the events stream — only
 // the redacted form of the URL appears in event messages.
-func (o *Orchestrator) cloneAtSHA(ctx context.Context, sha string, events chan<- server.TFApplyEvent) error {
+func (o *Orchestrator) cloneAtSHA(ctx context.Context, sha string, emit emitFn) error {
 	cloneURL, err := o.resolveCloneURL(ctx)
 	if err != nil {
 		return fmt.Errorf("resolve clone URL: %w", err)
@@ -163,7 +207,7 @@ func (o *Orchestrator) cloneAtSHA(ctx context.Context, sha string, events chan<-
 		"clone", "--filter=blob:none", "--no-checkout", cloneURL, o.WorkDir,
 	)
 	clone.Env = o.fullEnv()
-	if err := streamCommand(ctx, clone, "git_fetch", events); err != nil {
+	if err := streamCommand(ctx, clone, "git_fetch", emit); err != nil {
 		return err
 	}
 
@@ -171,7 +215,7 @@ func (o *Orchestrator) cloneAtSHA(ctx context.Context, sha string, events chan<-
 		"-C", o.WorkDir, "checkout", "--detach", sha,
 	)
 	checkout.Env = o.fullEnv()
-	return streamCommand(ctx, checkout, "git_fetch", events)
+	return streamCommand(ctx, checkout, "git_fetch", emit)
 }
 
 // resolveCloneURL returns the URL to pass to `git clone`. If TokenSource
@@ -200,20 +244,32 @@ func (o *Orchestrator) resolveCloneURL(ctx context.Context) (string, error) {
 	return parsed.String(), nil
 }
 
-func (o *Orchestrator) tfInit(ctx context.Context, rootPath string, events chan<- server.TFApplyEvent) error {
+func (o *Orchestrator) tfInit(ctx context.Context, rootPath string, emit emitFn) error {
 	cmd := exec.CommandContext(ctx, o.tfBin(),
 		"-chdir="+rootPath, "init", "-input=false", "-no-color",
 	)
 	cmd.Env = o.fullEnv()
-	return streamCommand(ctx, cmd, "tf_init", events)
+	return streamCommand(ctx, cmd, "tf_init", emit)
 }
 
-func (o *Orchestrator) tfApply(ctx context.Context, rootPath string, events chan<- server.TFApplyEvent) error {
+func (o *Orchestrator) tfApply(ctx context.Context, rootPath string, emit emitFn) error {
 	cmd := exec.CommandContext(ctx, o.tfBin(),
 		"-chdir="+rootPath, "apply", "-input=false", "-auto-approve", "-no-color",
 	)
 	cmd.Env = o.fullEnv()
-	return streamCommand(ctx, cmd, "tf_apply", events)
+	return streamCommand(ctx, cmd, "tf_apply", emit)
+}
+
+// tfPlan runs `terraform plan` without -detailed-exitcode: we want
+// exit 0 on "plan succeeded with or without diff", and a non-zero exit
+// only on actual error (auth, syntax, missing provider). The reviewer
+// reads the streamed plan output and judges the diff.
+func (o *Orchestrator) tfPlan(ctx context.Context, rootPath string, emit emitFn) error {
+	cmd := exec.CommandContext(ctx, o.tfBin(),
+		"-chdir="+rootPath, "plan", "-input=false", "-no-color", "-lock-timeout=60s",
+	)
+	cmd.Env = o.fullEnv()
+	return streamCommand(ctx, cmd, "tf_plan", emit)
 }
 
 func (o *Orchestrator) fullEnv() []string {
@@ -222,9 +278,9 @@ func (o *Orchestrator) fullEnv() []string {
 }
 
 // streamCommand runs cmd with combined stdout+stderr forwarded line by
-// line to events under the given phase. Returns the command's exit
+// line to emit under the given phase. Returns the command's exit
 // error (with output context for diagnosis).
-func streamCommand(ctx context.Context, cmd *exec.Cmd, phase string, events chan<- server.TFApplyEvent) error {
+func streamCommand(ctx context.Context, cmd *exec.Cmd, phase string, emit emitFn) error {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
 		if cmd.Process == nil {
@@ -247,23 +303,22 @@ func streamCommand(ctx context.Context, cmd *exec.Cmd, phase string, events chan
 	}
 
 	done := make(chan struct{}, 2)
-	go pipeLines(ctx, stdoutPipe, phase, events, done)
-	go pipeLines(ctx, stderrPipe, phase, events, done)
+	go pipeLines(ctx, stdoutPipe, phase, emit, done)
+	go pipeLines(ctx, stderrPipe, phase, emit, done)
 	<-done
 	<-done
 
 	return cmd.Wait()
 }
 
-func pipeLines(ctx context.Context, r io.Reader, phase string, events chan<- server.TFApplyEvent, done chan<- struct{}) {
+func pipeLines(ctx context.Context, r io.Reader, phase string, emit emitFn, done chan<- struct{}) {
 	defer func() { done <- struct{}{} }()
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	for scanner.Scan() {
 		line := scanner.Text()
-		select {
-		case events <- server.TFApplyEvent{Phase: phase, Message: line, Time: time.Now()}:
-		case <-ctx.Done():
+		emit(phase, line)
+		if ctx.Err() != nil {
 			return
 		}
 	}
