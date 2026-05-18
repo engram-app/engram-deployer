@@ -63,6 +63,29 @@ func TestOrchestrator_RunReturnsConfigErrorEarly(t *testing.T) {
 	}
 }
 
+// Plan mirrors Run's early-config-failure contract: bad config returns
+// wrapped error AND closes the events channel via defer.
+func TestOrchestrator_PlanReturnsConfigErrorEarly(t *testing.T) {
+	orch := &Orchestrator{} // empty — invalid
+
+	events := make(chan server.TFPlanEvent, 4)
+	err := orch.Plan(context.Background(), "0123456789abcdef0123456789abcdef01234567", events)
+	if err == nil {
+		t.Fatal("Plan on empty Orchestrator returned nil, want error")
+	}
+	if !strings.Contains(err.Error(), "config invalid") {
+		t.Errorf("err = %q, want substring 'config invalid'", err.Error())
+	}
+	select {
+	case _, ok := <-events:
+		if ok {
+			t.Error("expected events channel closed; got value")
+		}
+	default:
+		t.Error("events channel not closed; receive would block")
+	}
+}
+
 // Run with a bogus repo URL surfaces a git error wrapped with the SHA
 // for grep-ability. The streamCommand path is exercised end-to-end on
 // a real git binary; this test asserts the error wrapping shape.

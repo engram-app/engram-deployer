@@ -13,8 +13,9 @@ import (
 // Config bundles the dependencies a Server needs.
 //
 // /deploy is always wired. /tf-apply is wired only when both
-// TFApplyValidator and TFApplier are non-nil — leaving either nil
-// disables the endpoint entirely (404).
+// TFApplyValidator and TFApplier are non-nil; same independence for
+// /tf-plan via TFPlanValidator + TFPlanner. Leaving either pair nil
+// disables that endpoint entirely (404).
 type Config struct {
 	Validator *auth.Validator
 	JTI       *auth.JTISet
@@ -23,6 +24,9 @@ type Config struct {
 
 	TFApplyValidator *auth.Validator
 	TFApplier        TFApplier
+
+	TFPlanValidator *auth.Validator
+	TFPlanner       TFPlanner
 }
 
 // Server is the HTTP entrypoint for the deployer daemon.
@@ -35,9 +39,12 @@ type Server struct {
 	mu                sync.RWMutex
 	lastResult        *DeployResult
 	lastTFApplyResult *TFApplyResult
+	lastTFPlanResult  *TFPlanResult
 
-	// applyMu serializes /deploy and /tf-apply — both mutate Docker
-	// state on the same host and must not run concurrently.
+	// applyMu serializes /deploy, /tf-apply, and /tf-plan — apply and
+	// deploy mutate Docker state; plan only reads, but shares the
+	// terraform workdir + state lock with apply, so concurrent runs
+	// would clash. Cheap to share since plan is fast (<1min).
 	applyMu sync.Mutex
 }
 
@@ -50,6 +57,10 @@ func New(cfg Config) *Server {
 	if cfg.TFApplyValidator != nil && cfg.TFApplier != nil {
 		s.mux.HandleFunc("POST /tf-apply", s.tfApply)
 		s.mux.HandleFunc("GET /tf-apply/status", s.tfApplyStatus)
+	}
+	if cfg.TFPlanValidator != nil && cfg.TFPlanner != nil {
+		s.mux.HandleFunc("POST /tf-plan", s.tfPlan)
+		s.mux.HandleFunc("GET /tf-plan/status", s.tfPlanStatus)
 	}
 	return s
 }

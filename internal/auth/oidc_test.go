@@ -103,6 +103,99 @@ func TestOIDCValidator_RejectsInvalidClaims(t *testing.T) {
 	}
 }
 
+// prPlanConfig returns a validator config suitable for /tf-plan PR-event
+// tokens: ref varies per PR so Subject + WorkflowRefPrefix replace exact
+// Ref + WorkflowRef pins.
+func prPlanConfig(iss *oidctest.Issuer) OIDCConfig {
+	return OIDCConfig{
+		JWKSURL:           iss.JWKSURL(),
+		Issuer:            "https://token.actions.githubusercontent.com",
+		Audience:          "engram-tf-plan",
+		Repository:        "engram-app/engram-infra",
+		Subject:           "repo:engram-app/engram-infra:pull_request",
+		WorkflowRefPrefix: "engram-app/engram-infra/.github/workflows/tf-plan.yml@",
+	}
+}
+
+func prPlanClaims(jti string) jwt.MapClaims {
+	now := time.Now()
+	return jwt.MapClaims{
+		"iss":          "https://token.actions.githubusercontent.com",
+		"aud":          "engram-tf-plan",
+		"iat":          now.Unix(),
+		"nbf":          now.Unix(),
+		"exp":          now.Add(15 * time.Minute).Unix(),
+		"jti":          jti,
+		"repository":   "engram-app/engram-infra",
+		"ref":          "refs/pull/42/merge",
+		"sub":          "repo:engram-app/engram-infra:pull_request",
+		"workflow_ref": "engram-app/engram-infra/.github/workflows/tf-plan.yml@refs/pull/42/merge",
+	}
+}
+
+func TestOIDCValidator_AcceptsPRTokenViaSubjectAndPrefix(t *testing.T) {
+	iss := oidctest.Shared(t)
+	v, err := NewValidator(context.Background(), prPlanConfig(iss))
+	if err != nil {
+		t.Fatalf("validator init: %v", err)
+	}
+	token := iss.Mint(t, prPlanClaims("pr-jti-1"))
+	if _, err := v.Validate(token); err != nil {
+		t.Fatalf("valid PR token rejected: %v", err)
+	}
+}
+
+func TestOIDCValidator_RejectsInvalidPRClaims(t *testing.T) {
+	iss := oidctest.Shared(t)
+	v, err := NewValidator(context.Background(), prPlanConfig(iss))
+	if err != nil {
+		t.Fatalf("validator init: %v", err)
+	}
+
+	cases := []struct {
+		name   string
+		mutate func(jwt.MapClaims)
+	}{
+		{"wrong sub", func(c jwt.MapClaims) { c["sub"] = "repo:engram-app/engram-infra:ref:refs/heads/main" }},
+		{"missing sub", func(c jwt.MapClaims) { delete(c, "sub") }},
+		{"workflow_ref outside prefix", func(c jwt.MapClaims) {
+			c["workflow_ref"] = "engram-app/engram-infra/.github/workflows/tf-apply.yml@refs/heads/main"
+		}},
+		{"workflow_ref empty", func(c jwt.MapClaims) { c["workflow_ref"] = "" }},
+		{"wrong repository", func(c jwt.MapClaims) { c["repository"] = "engram-app/evil" }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			claims := prPlanClaims("pr-jti-" + tc.name)
+			tc.mutate(claims)
+			token := iss.Mint(t, claims)
+			if _, err := v.Validate(token); err == nil {
+				t.Fatalf("validator accepted PR token mutated for %q", tc.name)
+			}
+		})
+	}
+}
+
+func TestNewValidator_RejectsEmptyRefAndSubject(t *testing.T) {
+	iss := oidctest.Shared(t)
+	cfg := validConfig(iss)
+	cfg.Ref = ""
+	cfg.Subject = ""
+	if _, err := NewValidator(context.Background(), cfg); err == nil {
+		t.Fatal("NewValidator accepted config with both Ref and Subject empty")
+	}
+}
+
+func TestNewValidator_RejectsEmptyWorkflowRefAndPrefix(t *testing.T) {
+	iss := oidctest.Shared(t)
+	cfg := validConfig(iss)
+	cfg.WorkflowRef = ""
+	cfg.WorkflowRefPrefix = ""
+	if _, err := NewValidator(context.Background(), cfg); err == nil {
+		t.Fatal("NewValidator accepted config with both WorkflowRef and WorkflowRefPrefix empty")
+	}
+}
+
 // alg=none and similar algorithm-confusion attacks must be refused
 // regardless of claim values.
 func TestOIDCValidator_RejectsAlgNone(t *testing.T) {

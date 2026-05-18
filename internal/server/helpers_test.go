@@ -68,6 +68,34 @@ func (f *fakeTFApplier) CalledWith() string {
 	return f.calledWith
 }
 
+// fakeTFPlanner mirrors fakeTFApplier for /tf-plan.
+type fakeTFPlanner struct {
+	mu         sync.Mutex
+	calledWith string
+	scriptEvts []TFPlanEvent
+	scriptErr  error
+}
+
+func (f *fakeTFPlanner) Plan(_ context.Context, sha string, events chan<- TFPlanEvent) error {
+	f.mu.Lock()
+	f.calledWith = sha
+	evs := append([]TFPlanEvent(nil), f.scriptEvts...)
+	err := f.scriptErr
+	f.mu.Unlock()
+
+	for _, e := range evs {
+		events <- e
+	}
+	close(events)
+	return err
+}
+
+func (f *fakeTFPlanner) CalledWith() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calledWith
+}
+
 // testServerOpts is configured via the functional opts passed to newTestServer.
 type testServerOpts struct {
 	deployer Deployer
@@ -76,6 +104,9 @@ type testServerOpts struct {
 	// existing /deploy tests don't pull in tf-apply machinery.
 	wireTFApply bool
 	tfApplier   TFApplier
+
+	wireTFPlan bool
+	tfPlanner  TFPlanner
 }
 
 func withDeployer(d Deployer) func(*testServerOpts) {
@@ -86,6 +117,13 @@ func withTFApplier(a TFApplier) func(*testServerOpts) {
 	return func(o *testServerOpts) {
 		o.wireTFApply = true
 		o.tfApplier = a
+	}
+}
+
+func withTFPlanner(p TFPlanner) func(*testServerOpts) {
+	return func(o *testServerOpts) {
+		o.wireTFPlan = true
+		o.tfPlanner = p
 	}
 }
 
@@ -144,6 +182,25 @@ func newTestServer(t *testing.T, opts ...func(*testServerOpts)) *Server {
 		cfg.TFApplier = o.tfApplier
 	}
 
+	if o.wireTFPlan {
+		planValidator, err := auth.NewValidator(context.Background(), auth.OIDCConfig{
+			JWKSURL:           iss.JWKSURL(),
+			Issuer:            "https://token.actions.githubusercontent.com",
+			Audience:          "engram-tf-plan",
+			Repository:        "engram-app/engram-infra",
+			Subject:           "repo:engram-app/engram-infra:pull_request",
+			WorkflowRefPrefix: "engram-app/engram-infra/.github/workflows/tf-plan.yml@",
+		})
+		if err != nil {
+			t.Fatalf("tf-plan validator init: %v", err)
+		}
+		cfg.TFPlanValidator = planValidator
+		if o.tfPlanner == nil {
+			o.tfPlanner = &fakeTFPlanner{}
+		}
+		cfg.TFPlanner = o.tfPlanner
+	}
+
 	return New(cfg)
 }
 
@@ -164,6 +221,28 @@ func mintValidToken(t *testing.T, jti string) string {
 		"repository":   "engram-app/Engram",
 		"ref":          "refs/heads/main",
 		"workflow_ref": "engram-app/Engram/.github/workflows/ci.yml@refs/heads/main",
+	})
+}
+
+// mintValidTFPlanToken returns a freshly-signed OIDC token whose claims
+// pass the /tf-plan validator gate (PR-event token: distinct audience,
+// pull_request subject, workflow_ref matching the tf-plan.yml prefix,
+// ref bearing a pull/N/merge format).
+func mintValidTFPlanToken(t *testing.T, jti string) string {
+	t.Helper()
+	iss := oidctest.Shared(t)
+	now := time.Now()
+	return iss.Mint(t, jwt.MapClaims{
+		"iss":          "https://token.actions.githubusercontent.com",
+		"aud":          "engram-tf-plan",
+		"iat":          now.Unix(),
+		"nbf":          now.Unix(),
+		"exp":          now.Add(15 * time.Minute).Unix(),
+		"jti":          jti,
+		"repository":   "engram-app/engram-infra",
+		"ref":          "repo:engram-app/engram-infra:pull_request",
+		"sub":          "repo:engram-app/engram-infra:pull_request",
+		"workflow_ref": "engram-app/engram-infra/.github/workflows/tf-plan.yml@refs/pull/42/merge",
 	})
 }
 

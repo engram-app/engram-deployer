@@ -57,6 +57,12 @@ type config struct {
 	TFAWSRegion        string
 	TFDockerHost       string
 
+	// tf-plan piggybacks on tf-apply: same repo, same root, same AWS
+	// creds, same Orchestrator. Only the OIDC validator differs (PR
+	// events have a different audience + sub claim).
+	TFPlanAudience     string
+	TFPlanWorkflowFile string
+
 	// GitHub App credentials for minting installation tokens used to
 	// clone private engram-infra. All three required when tf-apply is
 	// enabled AND the repo URL is https://github.com/... (any other
@@ -104,6 +110,9 @@ func loadConfig() (config, error) {
 		TFAppID:             os.Getenv("DEPLOYER_TF_APPLY_GH_APP_ID"),
 		TFAppInstallationID: os.Getenv("DEPLOYER_TF_APPLY_GH_APP_INSTALLATION_ID"),
 		TFAppPEMPath:        os.Getenv("DEPLOYER_TF_APPLY_GH_APP_PEM_PATH"),
+
+		TFPlanAudience:     envOr("DEPLOYER_TF_PLAN_AUDIENCE", "engram-tf-plan"),
+		TFPlanWorkflowFile: envOr("DEPLOYER_TF_PLAN_WORKFLOW_FILE", "tf-plan.yml"),
 	}
 	var missing []string
 	if cfg.CertFile == "" {
@@ -299,8 +308,31 @@ func main() {
 		srvCfg.TFApplier = tfOrch
 		log.Printf("engram-deployer: /tf-apply enabled (repo=%s root=%s)",
 			cfg.TFApplyRepository, cfg.TFApplyRootDir)
+
+		// /tf-plan piggybacks on the same Orchestrator (which implements
+		// TFPlanner as well as TFApplier). Distinct validator: PR-event
+		// tokens carry sub=repo:<repo>:pull_request and a workflow_ref
+		// containing tf-plan.yml; ref varies per PR so it's not pinned.
+		planSubject := fmt.Sprintf("repo:%s:pull_request", cfg.TFApplyRepository)
+		planWorkflowPrefix := fmt.Sprintf("%s/.github/workflows/%s@",
+			cfg.TFApplyRepository, cfg.TFPlanWorkflowFile)
+		planValidator, err := auth.NewValidator(ctx, auth.OIDCConfig{
+			JWKSURL:           cfg.JWKSURL,
+			Issuer:            cfg.Issuer,
+			Audience:          cfg.TFPlanAudience,
+			Repository:        cfg.TFApplyRepository,
+			Subject:           planSubject,
+			WorkflowRefPrefix: planWorkflowPrefix,
+		})
+		if err != nil {
+			log.Fatalf("init tf-plan OIDC validator: %v", err)
+		}
+		srvCfg.TFPlanValidator = planValidator
+		srvCfg.TFPlanner = tfOrch
+		log.Printf("engram-deployer: /tf-plan enabled (sub=%s workflow_ref prefix=%s)",
+			planSubject, planWorkflowPrefix)
 	} else {
-		log.Printf("engram-deployer: /tf-apply disabled (no DEPLOYER_TF_APPLY_* env)")
+		log.Printf("engram-deployer: /tf-apply + /tf-plan disabled (no DEPLOYER_TF_APPLY_* env)")
 	}
 
 	srv := server.New(srvCfg)
