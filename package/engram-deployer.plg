@@ -7,7 +7,13 @@
   <!ENTITY build     "1">
   <!ENTITY pkg       "&name;-&version;-&arch;-&build;">
   <!ENTITY gitURL    "https://github.com/&author;/engram-deployer">
-  <!ENTITY pluginURL "https://raw.githubusercontent.com/&author;/engram-deployer/main/package/engram-deployer.plg">
+  <!-- pluginURL points at the GitHub `releases/latest/download/` permalink
+       so Unraid's `plugin update` fetches the *materialized* .plg from
+       the most-recent release (concrete version + MD5 sed-substituted
+       by release.yml). Using the source-tree raw URL caused `plugin
+       update` to fetch this file with `0.0.0-DEV` placeholder still in
+       place, which then tried to download `v0.0.0-DEV.txz` → 404. -->
+  <!ENTITY pluginURL "https://github.com/&author;/engram-deployer/releases/latest/download/engram-deployer.plg">
   <!ENTITY plugin    "/boot/config/plugins/&name;">
   <!ENTITY md5       "REPLACE_WITH_PACKAGE_MD5">
 ]>
