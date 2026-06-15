@@ -244,12 +244,25 @@ func (o *Orchestrator) resolveCloneURL(ctx context.Context) (string, error) {
 	return parsed.String(), nil
 }
 
+// tfInit runs `terraform init`, retrying only transient network failures
+// (provider/module downloads) per withInitRetry. init is read-only and
+// runs before any mutation, so retrying it is safe — unlike apply, which
+// is never retried (a dropped connection mid-apply could double-apply).
+//
+// Each attempt captures the combined output alongside streaming it so a
+// failure can be classified. TF_PLUGIN_CACHE_DIR (injected via Env at
+// startup) means a successful prior download is reused, shrinking the
+// network surface that can blip in the first place.
 func (o *Orchestrator) tfInit(ctx context.Context, rootPath string, emit emitFn) error {
-	cmd := exec.CommandContext(ctx, o.tfBin(),
-		"-chdir="+rootPath, "init", "-input=false", "-no-color",
-	)
-	cmd.Env = o.fullEnv()
-	return streamCommand(ctx, cmd, "tf_init", emit)
+	return withInitRetry(ctx, emit, sleepCtx, func(attempt int) (string, error) {
+		capEmit, snapshot := newCapturingEmit(emit)
+		cmd := exec.CommandContext(ctx, o.tfBin(),
+			"-chdir="+rootPath, "init", "-input=false", "-no-color",
+		)
+		cmd.Env = o.fullEnv()
+		err := streamCommand(ctx, cmd, "tf_init", capEmit)
+		return snapshot(), err
+	})
 }
 
 func (o *Orchestrator) tfApply(ctx context.Context, rootPath string, emit emitFn) error {
