@@ -57,6 +57,13 @@ type config struct {
 	TFAWSRegion        string
 	TFDockerHost       string
 
+	// TFPluginCacheDir is TF_PLUGIN_CACHE_DIR for terraform init —
+	// providers downloaded once are reused across runs, shrinking the
+	// network surface that can blip. MUST be on persistent storage
+	// (Unraid /var/* is wiped on reboot); created at startup if absent.
+	// Empty disables the cache.
+	TFPluginCacheDir string
+
 	// tf-plan piggybacks on tf-apply: same repo, same root, same AWS
 	// creds, same Orchestrator. Only the OIDC validator differs (PR
 	// events have a different audience + sub claim).
@@ -106,6 +113,7 @@ func loadConfig() (config, error) {
 		TFAWSSecretKey:     os.Getenv("DEPLOYER_TF_AWS_SECRET_ACCESS_KEY"),
 		TFAWSRegion:        envOr("DEPLOYER_TF_AWS_REGION", "us-east-1"),
 		TFDockerHost:       envOr("DEPLOYER_TF_DOCKER_HOST", "unix:///var/run/docker.sock"),
+		TFPluginCacheDir:   envOr("DEPLOYER_TF_PLUGIN_CACHE_DIR", "/mnt/cache/appdata/engram-deployer/plugin-cache"),
 
 		TFAppID:             os.Getenv("DEPLOYER_TF_APPLY_GH_APP_ID"),
 		TFAppInstallationID: os.Getenv("DEPLOYER_TF_APPLY_GH_APP_INSTALLATION_ID"),
@@ -278,19 +286,31 @@ func main() {
 			log.Fatalf("init tf-apply OIDC validator: %v", err)
 		}
 
+		tfEnv := []string{
+			"AWS_ACCESS_KEY_ID=" + cfg.TFAWSAccessKeyID,
+			"AWS_SECRET_ACCESS_KEY=" + cfg.TFAWSSecretKey,
+			"AWS_REGION=" + cfg.TFAWSRegion,
+			"AWS_DEFAULT_REGION=" + cfg.TFAWSRegion,
+			"DOCKER_HOST=" + cfg.TFDockerHost,
+		}
+		// terraform requires TF_PLUGIN_CACHE_DIR to already exist; create
+		// it (on persistent storage) before injecting. Fatal on failure
+		// so a misconfigured cache path is loud, not a silent slow path.
+		if cfg.TFPluginCacheDir != "" {
+			if err := os.MkdirAll(cfg.TFPluginCacheDir, 0o700); err != nil {
+				log.Fatalf("create tf plugin cache dir %s: %v", cfg.TFPluginCacheDir, err)
+			}
+			tfEnv = append(tfEnv, "TF_PLUGIN_CACHE_DIR="+cfg.TFPluginCacheDir)
+			log.Printf("engram-deployer: tf plugin cache at %s", cfg.TFPluginCacheDir)
+		}
+
 		tfOrch := &tfapply.Orchestrator{
 			TFBinary:  cfg.TFBinaryPath,
 			GitBinary: cfg.TFGitBinaryPath,
 			RepoURL:   cfg.TFApplyRepoURL,
 			RootDir:   cfg.TFApplyRootDir,
 			WorkDir:   cfg.TFApplyWorkDir,
-			Env: []string{
-				"AWS_ACCESS_KEY_ID=" + cfg.TFAWSAccessKeyID,
-				"AWS_SECRET_ACCESS_KEY=" + cfg.TFAWSSecretKey,
-				"AWS_REGION=" + cfg.TFAWSRegion,
-				"AWS_DEFAULT_REGION=" + cfg.TFAWSRegion,
-				"DOCKER_HOST=" + cfg.TFDockerHost,
-			},
+			Env:       tfEnv,
 		}
 		if cfg.TFAppID != "" && cfg.TFAppInstallationID != "" && cfg.TFAppPEMPath != "" {
 			appSrc := &tfapply.AppTokenSource{
