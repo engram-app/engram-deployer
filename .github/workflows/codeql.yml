@@ -37,11 +37,11 @@
         # in-job (setup-go below for go).
         runs-on: [self-hosted, linux, x64, isolated]
         steps:
-          - uses: actions/checkout@v6
+          - uses: actions/checkout@v7
           # autobuild runs `go build ./...` — needs a Go toolchain in PATH. The
           # runner VM doesn't ship Go (would need root); setup-go installs into
           # the persistent tool cache so subsequent runs hit warm.
-          - uses: actions/setup-go@v6
+          - uses: actions/setup-go@v7
             with:
               go-version-file: go.mod
               cache: true
